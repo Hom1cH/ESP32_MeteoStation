@@ -49,6 +49,7 @@ bool Clock_Settings_Done = false;
 bool Graph_Settings_Done = false;
 bool Settings_Done = false;
 bool Graph_Reset = false;
+bool Sleep = false;
 // -------   Переменные энкодера   -------
 volatile int ENC_Pos = 0;
 volatile int ENC_LastPosition = 0;
@@ -645,7 +646,7 @@ void settings(){
     lcd.setCursor(0, 3);
     lcd.print("Set_5");
     lcd.setCursor(15, 1);
-    lcd.print("Set_2");
+    lcd.print("Sleep");
     lcd.setCursor(15, 2);
     lcd.print("Set_4");
     lcd.setCursor(16, 3);
@@ -665,6 +666,21 @@ void settings(){
       case 2:
         lcd.setCursor(10, 1);
         lcd.print(">");
+        if(digitalRead(BTN_PIN) == LOW) {
+          lcd.clear();
+          lcd.setBacklight(false);// ХЗ
+          Sleep = true;
+          while (Sleep == true)
+          {
+            delay(500);
+            if(digitalRead(BTN_PIN) == LOW){
+              Sleep = false;
+            } 
+          }
+          lcd.setBacklight(true);
+          delay(500);
+          Settings_Done = true;
+        }
         break;
       case 3:
         lcd.setCursor(9, 2);
