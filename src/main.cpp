@@ -58,8 +58,11 @@ long baseEncoder = ENC_Pos;
 unsigned long lastTimeUpdate = 0;
 
 // -------   Переменные для меню   -------
-uint8_t menuMode = 0;
-uint8_t undermenuMode = 0;
+bool swichMode = 0;
+int menuMode = 0;
+int undermenuMode = 0;
+volatile bool buttonPressed = false;  // Флаг для обработки кнопки
+volatile unsigned long lastButtonInterrupt = 0;  // Время последнего прерывания
 // -------   Переменные, Класс и Деки для работы с метеоданными   ---------
 class FloatDeque {
   private:
@@ -69,22 +72,42 @@ class FloatDeque {
   public:
       FloatDeque(const FloatDeque&) = delete;
       FloatDeque& operator=(const FloatDeque&) = delete;
+      
       FloatDeque(int maxSize) {
-          capacity = maxSize;
-          data = new float[capacity];
+          if (maxSize <= 0) {
+              capacity = 0;
+              data = nullptr;
+          } else {
+              capacity = maxSize;
+              data = new float[capacity];
+              if (data) {
+                  // Инициализируем массив нулями
+                  for (int i = 0; i < capacity; i++) {
+                      data[i] = 0.0f;
+                  }
+              } else {
+                  capacity = 0; // Если выделение памяти не удалось
+              }
+          }
           front = 0;
           rear = -1;
           size = 0;
       }
   
       ~FloatDeque() {
-          delete[] data;
+          if (data) {
+              delete[] data;
+              data = nullptr;
+          }
       }
   
       bool isFull() { return size == capacity; }
       bool isEmpty() { return size == 0; }
+      bool isValid() { return data != nullptr && capacity > 0; }
   
       void push_front(float value) {
+          if (!isValid()) return;
+          
           if (isFull()) pop_back();
           front = (front - 1 + capacity) % capacity;
           data[front] = value;
@@ -92,6 +115,8 @@ class FloatDeque {
       }
   
       void push_back(float value) {
+          if (!isValid()) return;
+          
           if (isFull()) pop_front();
           rear = (rear + 1) % capacity;
           data[rear] = value;
@@ -99,20 +124,20 @@ class FloatDeque {
       }
   
       void pop_front() {
-          if (isEmpty()) return;
+          if (isEmpty() || !isValid()) return;
           front = (front + 1) % capacity;
           size--;
       }
   
       void pop_back() {
-          if (isEmpty()) return;
+          if (isEmpty() || !isValid()) return;
           rear = (rear - 1 + capacity) % capacity;
           size--;
       }
   
       float average() {
-          if (isEmpty()) return 0.0;
-          float sum = 0.0;
+          if (isEmpty() || !isValid()) return 0.0f;
+          float sum = 0.0f;
           for (int i = 0; i < size; i++) {
               int index = (front + i) % capacity;
               sum += data[index];
@@ -121,14 +146,17 @@ class FloatDeque {
       }
   
       void copyToArray(float* destArray, uint8_t length) {
-          for(int i = 0; i<length; i++)
-          {
-              destArray[i] = 0;
+          if (!destArray || !isValid()) return;
+          
+          // Инициализируем массив назначения нулями
+          for(int i = 0; i < length; i++) {
+              destArray[i] = 0.0f;
           }
-          int copySize = (length < size) ? length : size; // Не копіюємо більше, ніж є в деку
+          
+          int copySize = (length < size) ? length : size;
           for (int i = 0; i < copySize; i++) {
-              int index = (front + i) % capacity; // Отримуємо правильний індекс у деку
-              destArray[copySize - 1 - i] = data[index]; // Копіюємо в зворотному порядку
+              int index = (front + i) % capacity;
+              destArray[copySize - 1 - i] = data[index];
           }
       }
 };
@@ -155,20 +183,6 @@ uint8_t index_1m = 0, index_10m = 0, index_2h = 0, index_1d = 0, index_12d = 0, 
 float temp[12] = {0};
 
 // ******************   ФУНКЦИИ   ******************
-// -------   Функция обработки энкодера   -------
-void updateEncoder() {
-  int ENC_First = digitalRead(ENC_F_PIN);
-  int ENC_Last = digitalRead(ENC_L_PIN);
-  int ENC_CurentPosition = (ENC_First << 1) | ENC_Last;
-  int ENC_Sum = (ENC_LastPosition << 2) | ENC_CurentPosition;
-
-  if (ENC_Sum == 0b1101 || ENC_Sum == 0b0100 || ENC_Sum == 0b0010 || ENC_Sum == 0b1011)
-    ENC_Pos++;
-  if (ENC_Sum == 0b1110 || ENC_Sum == 0b0111 || ENC_Sum == 0b0001 || ENC_Sum == 0b1000)
-    ENC_Pos--;
-  ENC_LastPosition = ENC_CurentPosition;
-}
-
 //  --------   Функции отрисовки часов  --------
 void printNumber(uint8_t number,uint8_t col) 
 {
@@ -607,18 +621,17 @@ void drawBarGraph(FloatDeque &data, uint8_t dataSize,uint8_t index, String name,
 }
 
 // -------   Функции меню   -------
-void menu_swich(){
-  // Переключение между пунктами меню
-  if(digitalRead(BTN_PIN) == LOW){
-    delay(200);
-    menuMode++;
-    undermenuMode = 1;
-    if(menuMode > 8) menuMode = 0;
-    Graph_Reset = false;
-    lcd.clear();
+void IRAM_ATTR buttonInterrupt() { // прерывание для кнопки
+  unsigned long currentTime = millis();
+  
+  // Простой debounce в прерывании (200ms)
+  if (currentTime - lastButtonInterrupt > 200) {
+    buttonPressed = true;
+    lastButtonInterrupt = currentTime;
   }
 }
-void undermenu_swich(uint8_t &undermenuMode, uint8_t high_value, uint8_t low_value){
+
+void menu_swich(int &undermenuMode, uint8_t high_value, uint8_t low_value){
   // Переключение между подменю
   int step = (ENC_Pos - baseEncoder) / 4;
   if (step != 0) {
@@ -630,13 +643,14 @@ void undermenu_swich(uint8_t &undermenuMode, uint8_t high_value, uint8_t low_val
     lcd.clear();
   }
 }
+
 void settings(){
   Settings_Done = false;
   undermenuMode = 6;  // начинаем с первого пункта
   
   while (Settings_Done != true)  // цикл работает, пока не нажата кнопка
   {
-    undermenu_swich(undermenuMode, 6, 1);
+    menu_swich(undermenuMode, 6, 1);
     lcd.setCursor(0, 0);
     lcd.print("Settings:");
     lcd.setCursor(0, 1);
@@ -668,7 +682,7 @@ void settings(){
         lcd.print(">");
         if(digitalRead(BTN_PIN) == LOW) {
           lcd.clear();
-          lcd.setBacklight(false);// ХЗ
+          lcd.setBacklight(false);
           Sleep = true;
           while (Sleep == true)
           {
@@ -708,111 +722,202 @@ void settings(){
     }
     delay(150);
   }
-  
   menuMode = 0;
-}
-void menu(){
-  menu_swich();
-  switch (menuMode)
-  {
-  case 0: // часы
-    printClock();
-    delay(100);
-    break;
-  case 1: // метеоданные
-    if((millis()/1000)%2==0){
-      printMeteoData();
-    }
-    break;
-  case 2: // Температура
-    undermenu_swich(undermenuMode, 5, 1);
-    switch (undermenuMode)
-    {
-    case 1:
-      drawBarGraph(temp_1m,12,index_1m,"Temp", "1min");
-      break;
-    case 2:
-      drawBarGraph(temp_10m,10,index_10m,"Temp", "10min");
-      break;
-    case 3:
-      drawBarGraph(temp_2h,12,index_2h,"Temp", "2hours");
-      break;
-    case 4: 
-      drawBarGraph(temp_1d,12,index_1d,"Temp", "1day");
-      break;
-    case 5:
-      drawBarGraph(temp_12d,12,index_12d,"Temp", "12days");
-      break;
-    default:
-      break;
-    }
-  break;
-  case 3: // Влажность
-    undermenu_swich(undermenuMode, 5, 1);
-    switch (undermenuMode)
-    {
-      case 1:
-      drawBarGraph(hum_1m,12,index_1m,"Hum", "1min");
-      break;
-    case 2:
-      drawBarGraph(hum_10m,10,index_10m,"Hum", "10min");
-      break;
-    case 3:
-      drawBarGraph(hum_2h,12,index_2h,"Hum", "2hours");
-      break;
-    case 4:
-      drawBarGraph(hum_1d,12,index_1d,"Hum", "1day");
-      break;
-    case 5:
-      drawBarGraph(hum_12d,12,index_12d,"Hum", "12days");
-      break;
-    default:
-      break;
-    }
-    break;
-  case 4: // CO2
-    undermenu_swich(undermenuMode, 5, 1);
-    switch (undermenuMode)
-    {
-      case 1:
-      drawBarGraph(CO2_1m,12,index_1m,"CO2", "1min");
-      break;
-    case 2:
-      drawBarGraph(CO2_10m,10,index_10m,"CO2", "10min");
-      break;
-    case 3:
-      drawBarGraph(CO2_2h,12,index_2h,"CO2", "2hours");
-      break;
-    case 4:
-      drawBarGraph(CO2_1d,12,index_1d,"CO2", "1day");
-      break;
-    case 5:
-      drawBarGraph(CO2_12d,12,index_12d,"CO2", "12days");
-      break;
-    default:
-      break;
-    }
-    break;
-  case 5:
-    lcd.setCursor(0, 0); 
-    lcd.print("MODE 5");
-    break;
-  case 6:
-    lcd.setCursor(0, 0);
-    lcd.print("MODE 6");
-    break;
-  case 7:
-    lcd.setCursor(0, 0);
-    lcd.print("MODE 7");
-    break;
-  case 8:
-    settings();
-    break;
-  default:
-    break;
-  }
+  undermenuMode = 0;
+  swichMode = 0;
 }
 
+// Новое меню
+
+// Структура одного пункта меню
+struct MenuSettings {
+  void (*functionPtr)();
+};
+
+// Менеджер меню
+class MenuManager {
+  public:
+    static const int ROWS = 9;  // Исправляем размер
+    static const int COLS = 5;
+    
+    int menuMode = 0;
+    int undermenuMode = 0;
+    bool swichMode = 0;
+
+    MenuSettings menu[ROWS][COLS];
+  
+    MenuManager() {
+      // Часы
+      menu[0][0] = { printClock };
+
+      // Текущие метеоданные
+      menu[1][0] = { printMeteoData };
+
+      // Температура
+      menu[2][0] = { []() { drawBarGraph(temp_1m, 12, index_1m, "Temp", "1min"); }};
+      menu[2][1] = { []() { drawBarGraph(temp_10m, 10, index_10m, "Temp", "10min"); }};
+      menu[2][2] = { []() { drawBarGraph(temp_2h, 12, index_2h, "Temp", "2h"); }};
+      menu[2][3] = { []() { drawBarGraph(temp_1d, 12, index_1d, "Temp", "1d"); }};
+      menu[2][4] = { []() { drawBarGraph(temp_12d, 12, index_12d, "Temp", "12d"); }};
+  
+      // Влажность
+      menu[3][0] = { []() { drawBarGraph(hum_1m, 12, index_1m, "Hum", "1min"); }};
+      menu[3][1] = { []() { drawBarGraph(hum_10m, 10, index_10m, "Hum", "10min"); }};
+      menu[3][2] = { []() { drawBarGraph(hum_2h, 12, index_2h, "Hum", "2h"); }};
+      menu[3][3] = { []() { drawBarGraph(hum_1d, 12, index_1d, "Hum", "1d"); }};
+      menu[3][4] = { []() { drawBarGraph(hum_12d, 12, index_12d, "Hum", "12d"); }};
+  
+      // CO2
+      menu[4][0] = { []() { drawBarGraph(CO2_1m, 12, index_1m, "CO2", "1min"); }};
+      menu[4][1] = { []() { drawBarGraph(CO2_10m, 10, index_10m, "CO2", "10min"); }};
+      menu[4][2] = { []() { drawBarGraph(CO2_2h, 12, index_2h, "CO2", "2h"); }};
+      menu[4][3] = { []() { drawBarGraph(CO2_1d, 12, index_1d, "CO2", "1d"); }};
+      menu[4][4] = { []() { drawBarGraph(CO2_12d, 12, index_12d, "CO2", "12d"); }};
+
+      //
+      menu[5][0] = { []() {
+        lcd.setCursor(0,0);
+        lcd.print("Comp DATA");
+        lcd.setCursor(0,1);
+        lcd.print("Comming soon..."); 
+      }};
+      
+      //
+      menu[6][0] = { []() { 
+        lcd.setCursor(0,0);
+        lcd.print("Test 1"); 
+      }};
+      //
+      menu[7][0] = { []() { 
+        lcd.setCursor(0,0);
+        lcd.print("Test 2"); 
+      }};
+      
+      //
+      menu[8][0] = { []() { 
+        lcd.setCursor(0,0);
+        lcd.print("Settings"); 
+      }};
+      menu[8][1] = { []() { settings(); }};
+
+    }
+
+    int undermenuSize(int row) {
+      if (row < 0 || row >= ROWS) return 0;
+      
+      int count = 0;
+      for (int i = 0; i < COLS; i++) {
+        if (menu[row][i].functionPtr) {
+          count++;
+        } else {
+          break;
+        }
+      }
+      return count;
+    }
+
+    void updateEncoder() {
+      int ENC_First = digitalRead(ENC_F_PIN);
+      int ENC_Last = digitalRead(ENC_L_PIN);
+      int ENC_CurentPosition = (ENC_First << 1) | ENC_Last;
+      int ENC_Sum = (ENC_LastPosition << 2) | ENC_CurentPosition;
+    
+      if (ENC_Sum == 0b1101 || ENC_Sum == 0b0100 || ENC_Sum == 0b0010 || ENC_Sum == 0b1011)
+        ENC_Pos++;
+      if (ENC_Sum == 0b1110 || ENC_Sum == 0b0111 || ENC_Sum == 0b0001 || ENC_Sum == 0b1000)
+        ENC_Pos--;
+      ENC_LastPosition = ENC_CurentPosition;
+    }
+
+    void modeSwicher(){
+      swichMode = !swichMode;
+      
+      // Сброс подменю при переключении режимов
+      if (!swichMode) {
+        undermenuMode = 0;
+      }
+    }
+
+    void Swicher(){
+      int step = (ENC_Pos - baseEncoder) / 4;
+      if (step != 0) {
+        
+        if(swichMode == 0){
+          // Переключение между основными меню
+          menuMode += step;
+          
+          // Обработка границ
+          if (menuMode >= ROWS) {
+            menuMode = 0;
+          }
+          if (menuMode < 0) {
+            menuMode = ROWS - 1;
+          }
+          
+          undermenuMode = 0;  // Сброс подменю
+          Graph_Reset = false;
+          lcd.clear();
+        }
+        else{
+          // Переключение в подменю
+          int maxSubmenu = undermenuSize(menuMode) - 1;
+          
+          if (maxSubmenu >= 0) {
+            undermenuMode += step;
+            
+            // Правильная обработка границ подменю
+            if (undermenuMode > maxSubmenu) {
+              undermenuMode = 0;
+            }
+            if (undermenuMode < 0) {
+              undermenuMode = maxSubmenu;
+            }
+            
+            Graph_Reset = false;
+            lcd.clear();
+          }
+        }
+        
+        // Обновляем базовую позицию энкодера
+        baseEncoder += step * 4;
+      }
+    }
+  
+    void showCurrent() {
+      // Добавляем защиту от слишком частых обновлений
+      static unsigned long lastMenuUpdate = 0;
+      unsigned long currentTime = millis();
+      
+      // Обновляем меню не чаще чем раз в 50мс
+      if (currentTime - lastMenuUpdate < 50) {
+        return;
+      }
+      
+      Swicher();
+      
+      // Проверяем валидность индексов меню
+      if (menuMode < 0 || menuMode >= ROWS) {
+        Serial.println("ERROR: Invalid menuMode");
+        menuMode = 0;
+      }
+      
+      if (undermenuMode < 0 || undermenuMode >= COLS) {
+        Serial.println("ERROR: Invalid undermenuMode");
+        undermenuMode = 0;
+      }
+      
+      MenuSettings& item = menu[menuMode][undermenuMode];
+      if (item.functionPtr) {
+        item.functionPtr();
+      } else {
+        Serial.println("ERROR: NOT_A_FUNCTION");
+      }
+      
+      lastMenuUpdate = currentTime;
+    }
+};
+
+MenuManager menuManager;
 // -------   Setup и Loop   -------
 void setup() {
   Serial.begin(115200);
@@ -829,9 +934,9 @@ void setup() {
   }
   SCD40.startPeriodicMeasurement();
 
-  attachInterrupt(digitalPinToInterrupt(ENC_F_PIN), updateEncoder, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENC_L_PIN), updateEncoder, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(BTN_PIN), menu_swich, LOW);
+  attachInterrupt(digitalPinToInterrupt(ENC_F_PIN), [](){menuManager.updateEncoder();}, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_L_PIN), [](){menuManager.updateEncoder();}, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(BTN_PIN), buttonInterrupt, FALLING);  // Добавляем прерывание для кнопки
 
   uint8_t a = digitalRead(ENC_F_PIN);
   uint8_t b = digitalRead(ENC_L_PIN);
@@ -869,7 +974,12 @@ void setup() {
 }
 
 void loop() {
-  menu();
+  // Обработка кнопки через прерывание
+  if (buttonPressed) {
+    menuManager.modeSwicher();
+    buttonPressed = false;  // Сбрасываем флаг
+  }
+  
+  menuManager.showCurrent();
+  delay(100);
 }
-
-
